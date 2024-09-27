@@ -7,42 +7,13 @@ import math
 # ===== Neural network building defaults =====
 DEFAULT_DTYPE = torch.float32
 
-def nonlinearity(x):
-    return F.silu(x)
-
-
-def normalize(x, *, temb, num_groups=4):
-    num_channels = x.shape[1]
-    return F.group_norm(x, num_groups=num_groups, num_channels=num_channels)
-
-
-def upsample(x, with_conv=False):
-    B, C, H, W = x.shape
-    x = F.interpolate(x, size=(H * 2, W * 2), mode='nearest')
-    assert x.shape == (B, C, H * 2, W * 2)
-    if with_conv:
-        # todo: see how it is being is used and update
-        pass
-    return x
-
-
-def downsample(x, with_conv):
-    B, C, H, W = x.shape
-    if with_conv:
-        # todo: see how it is being is used and update
-        pass
-    else:
-        x = F.avg_pool2d(x, 2, 2, padding=0)
-    assert x.shape == [B, C , H // 2, W//2]
-    return x
-
 
 class Downsample(nn.Module):
     def __init__(self, ch, with_conv):
         super().__init__()
         self.downsample = None
         if with_conv:
-            self.downsample = nn.Conv2d(in_channels=ch, out_channels=ch, kernel_size=3, stride=2, padding=1)
+            self.downsample = nn.Conv2d(in_channels=ch, out_channels=ch, kernel_size=3, stride=2)
         else:
             self.downsample = nn.AvgPool2d(kernel_size=2, stride=2)
 
@@ -111,23 +82,23 @@ class Nin(nn.Module):
         return x
 
 
-class ResNetBlock(nn.Module):
+class ResnetBlock2D(nn.Module):
     def __init__(self, in_ch, temb_channels, out_ch=None, conv_shortcut=False, dropout=0.0):
-        super(ResNetBlock, self).__init__()
+        super(ResnetBlock2D, self).__init__()
 
         self.in_ch = in_ch
         self.out_ch = out_ch or in_ch
         self.conv_shortcut = conv_shortcut
 
         # first normalization and convolution
-        self.norm1 = nn.GroupNorm(num_groups=32, num_channels=in_ch)
+        self.norm1 = nn.GroupNorm(num_groups=32, num_channels=in_ch, eps=1e-6)
         self.conv1 = nn.Conv2d(in_ch, self.out_ch, kernel_size=3, stride=1, padding=1)
 
         # timestep embedding projection
-        self.temb_proj = nn.Linear(temb_channels, self.out_ch)
+        self.time_emb_proj = nn.Linear(temb_channels, self.out_ch)
 
         # second normalization, dropout, convolution
-        self.norm2 = nn.GroupNorm(num_groups=32, num_channels=out_ch)
+        self.norm2 = nn.GroupNorm(num_groups=32, num_channels=out_ch, eps=1e-6)
         self.dropout = nn.Dropout(dropout)
         self.conv2 = nn.Conv2d(self.out_ch, self.out_ch, kernel_size=3, stride=1, padding=1)
 
@@ -146,7 +117,7 @@ class ResNetBlock(nn.Module):
         h = self.conv1(h)
 
         # add in timestep embedding
-        h += self.temb_proj(F.silu(temb))[:, :, None, None]
+        h += self.time_emb_proj(F.silu(temb))[:, :, None, None]
 
         # second path
         h = F.silu(self.norm2(h))
@@ -167,7 +138,7 @@ class AttnBlock(nn.Module):
         self.q_nin = Nin(in_ch, in_ch)
         self.k_nin = Nin(in_ch, in_ch)
         self.v_nin = Nin(in_ch, in_ch)
-        self.norm = nn.GroupNorm(num_groups=32, num_channels=in_ch)
+        self.norm = nn.GroupNorm(num_groups=32, num_channels=in_ch, eps=1e-6)
         self.out_proj = Nin(in_ch, in_ch, init_scale=0.0) # verify shape
 
     def forward(self, x, temb):
@@ -198,65 +169,90 @@ class AttnBlock(nn.Module):
 
         # residual connection
         return x + h
-        
+    
 
-class Model(nn.Module):
+class TimestepEmbedding(nn.Module):
+    def __init__(self, in_ch, out_ch) -> None:
+        super().__init__()
+        self.linear_1 = nn.Linear(in_ch, out_ch)
+        self.act = nn.SiLU()
+        self.linear_2 = nn.Linear(out_ch, out_ch)
+        
+    def forward(self, x):
+        x = self.linear_1(x)
+        x = self.act(x)
+        x = self.linear_2(x)
+        return x
+    
+
+class DownBlock2D(nn.Module):
+    def __init__(self, num_res_blocks, in_ch, out_ch, current_resolution, temb_channels, dropout) -> None:
+        super().__init__()
+        
+        self.resnets = nn.ModuleList()
+        for i_block in range(num_res_blocks):
+            self.resnets.append(ResnetBlock2D(in_ch=in_ch, temb_channels=temb_channels,
+                                              out_ch=out_ch, dropout=dropout))
+
+
+class UNet2DModel(nn.Module):
     def __init__(self, num_classes, ch, num_res_blocks, initial_resolution, attn_resolutions, out_ch,
-                 ch_mult=(1, 2, 4, 8), dropout=0., resamp_with_conv=True) -> None:
+                 ch_mult=(1, 2, 4, 8), dropout=0., resamp_with_conv=True, conv_shortcut=False) -> None:
         super().__init__()
 
         num_resolutions = len(ch_mult)
         assert num_classes == 1, 'not supported'
         self.ch = ch
-        
-        self.temb_fc1 = nn.Linear(ch, ch * 4)
-        self.temb_fc2 = nn.Linear(ch * 4, ch * 4)
+    
+        self.time_embedding = TimestepEmbedding(ch, ch * 4)
         
         # Downsampling
         self.conv_in = nn.Conv2d(in_channels=3, out_channels=self.ch, kernel_size=3, stride=1, padding=1)
-        self.downsampling_blocks = []
+        self.down_blocks = nn.ModuleList()  # Use nn.ModuleList instead of a plain list
         for i_level in range(num_resolutions):
-            layers = []
+            layers = nn.ModuleList()  # Use nn.ModuleList here as well
             # Calculate the current resolution at this downsampling level
-            current_resolution = initial_resolution // ch_mult[i_level]
+            current_resolution = initial_resolution // 2 ** i_level
             in_ch = ch if (i_level == 0) else ch * ch_mult[i_level - 1]
+            # print(f'ch_mult[{i_level}: {ch_mult[i_level]}, current_resolution: {current_resolution}, attn_resolutions: {attn_resolutions}')
             # Residual blocks for this resolution
             for i_block in range(num_res_blocks):
-                layers.append(ResNetBlock(in_ch=in_ch, temb_channels=ch * 4,
-                                 out_ch=ch * ch_mult[i_level], dropout=dropout))
+                layers.append(ResnetBlock2D(in_ch=in_ch, temb_channels=ch * 4,
+                                 out_ch=ch * ch_mult[i_level], dropout=dropout, conv_shortcut=conv_shortcut))
                 if current_resolution in attn_resolutions:
                     layers.append(AttnBlock(ch * ch_mult[i_level]))
             
             if i_level != num_resolutions - 1:
                 layers.append(Downsample(ch * ch_mult[i_level], resamp_with_conv))
-            self.downsampling_blocks.append(layers)
+            self.down_blocks.append(layers)
 
         # Middle
-        self.mid_block1 = ResNetBlock(in_ch=ch * ch_mult[i_level], temb_channels=ch * 4,
-            out_ch=ch * ch_mult[-1], dropout=dropout)
+        self.mid_block1 = ResnetBlock2D(in_ch=ch * ch_mult[i_level], temb_channels=ch * 4,
+            out_ch=ch * ch_mult[-1], dropout=dropout, conv_shortcut=conv_shortcut)
         self.mid_attn = AttnBlock(ch * ch_mult[-1])
-        self.mid_block2 = ResNetBlock(in_ch=ch * ch_mult[i_level], temb_channels=ch * 4,
-            out_ch=ch * ch_mult[-1], dropout=dropout)
+        self.mid_block2 = ResnetBlock2D(in_ch=ch * ch_mult[i_level], temb_channels=ch * 4,
+            out_ch=ch * ch_mult[-1], dropout=dropout, conv_shortcut=conv_shortcut)
         
         # Upsampling
-        self.upsampling_blocks = []
+        self.up_blocks = nn.ModuleList()  # Again, use nn.ModuleList
         for i_level in reversed(range(num_resolutions)):
-            current_resolution = initial_resolution // ch_mult[i_level]
-            layers = []
+            current_resolution = initial_resolution // 2 ** i_level
+            layers = nn.ModuleList()  # Use nn.ModuleList here too
             in_ch = ch * ch_mult[i_level]
             level_out_ch = ch if i_level == 0 else ch * ch_mult[i_level - 1]
             for i_block in range(num_res_blocks + 1):
                 layers.append(
-                    ResNetBlock(in_ch=in_ch, temb_channels= ch * 4, out_ch=level_out_ch, dropout=dropout))
+                    ResnetBlock2D(in_ch=in_ch, temb_channels= ch * 4, out_ch=level_out_ch,
+                                  dropout=dropout, conv_shortcut=conv_shortcut))
                 if current_resolution in attn_resolutions:
                     layers.append(AttnBlock(in_ch=level_out_ch))
             if i_level != 0:
                 layers.append(Upsample(ch=level_out_ch, with_conv=resamp_with_conv))
-            self.upsampling_blocks.append(layers)
+            self.up_blocks.append(layers)
 
         # End
-        self.norm_end = nn.GroupNorm(num_channels=32, num_channels=ch)
-        self.conv_end = nn.Conv2d(in_channels=ch, out_channels=out_ch, kernel_size=3, stride=1, padding=1)
+        self.conv_norm_out = nn.GroupNorm(num_groups=32, num_channels=ch, eps=1e-6)
+        self.conv_out = nn.Conv2d(in_channels=ch, out_channels=out_ch, kernel_size=3, stride=1, padding=1)
 
     def forward(self, x, t, y):
         B, C, H, W = x.shape
@@ -264,15 +260,13 @@ class Model(nn.Module):
         assert t.dtype in [torch.int32, torch.int64]
 
         temb = get_timestep_embedding(t, self.ch)
-        temb = self.temb_fc1(temb)
-        temb = F.silu(temb)
-        temb = self.temb_fc2(temb)
+        temb = self.time_embedding(temb)
         assert temb.shape == [B, self.ch * 4]
 
         h = self.conv_in(x)
         hs = [h]
 
-        for block in self.downsampling_blocks:
+        for block in self.down_blocks:
             for layer in block:
                 h = layer(h, temb)
             hs.append(h)
@@ -281,13 +275,13 @@ class Model(nn.Module):
         h = self.mid_attn(h, temb)
         h = self.mid_block2(h, temb)
 
-        for block in self.upsampling_blocks:
+        for block in self.up_blocks:
             h = torch.cat([h, hs.pop()], dim=1)
             for layer in block:
                 h = layer(h, temb)
 
-        h = self.norm_end(h)
+        h = self.conv_norm_out(h)
         h = F.silu(h)
-        h = self.conv_end(h)
+        h = self.conv_out(h)
 
         return h
