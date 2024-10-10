@@ -50,33 +50,39 @@ class GaussianDiffusion:
     Contains utilities for the diffusion model.
     """
 
-    def __init__(self, betas, loss_type, torch_dtype) -> None:
+    def __init__(self, betas, loss_type, device=torch.device('cpu'), torch_dtype=torch.float32) -> None:
         self.loss_type = loss_type
+        self.device = device
 
         assert isinstance(betas, np.ndarray)
-        self.np_betas = betas = betas.astype(np.float64) # computations here in float64 for accuracy
+        self.np_betas = betas = betas.astype(np.float64)  # computations here in float64 for accuracy
         assert (betas > 0).all() and (betas <= 1).all()
         timesteps, = betas.shape
         self.num_timesteps = int(timesteps)
 
-        self.betas = torch.tensor(betas, requires_grad=False)
+        # Move tensors to the specified device
+        self.betas = torch.tensor(betas, dtype=torch_dtype, device=self.device, requires_grad=False)
         alphas = 1 - self.betas
-        self.alphas_cumprod = torch.cumprod(alphas, dim=0)
+        self.alphas_cumprod = torch.cumprod(alphas, dim=0).to(self.device)
         self.alphas_cumprod_prev = torch.cat(
-            [torch.tensor([1.0], dtype=self.alphas_cumprod.dtype), self.alphas_cumprod[:-1]])
+            [torch.tensor([1.0], dtype=self.alphas_cumprod.dtype, device=self.device), self.alphas_cumprod[:-1]]
+        )
         
-        # calculations for diffusion q(x_t | x_{t-1}) and others
-        self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
-        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1 - self.alphas_cumprod)
-        self.log_one_minus_alphas_cumprod = torch.log(1 - self.alphas_cumprod)
-        self.sqrt_recip_alphas_cumprod = torch.sqrt(1 / self.alphas_cumprod)
-        self.sqrt_recipm1_alphas_cumprod = torch.sqrt( 1 / self.alphas_cumprod - 1)
+        # Calculations for diffusion q(x_t | x_{t-1}) and others
+        self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod).to(self.device)
+        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1 - self.alphas_cumprod).to(self.device)
+        self.log_one_minus_alphas_cumprod = torch.log(1 - self.alphas_cumprod).to(self.device)
+        self.sqrt_recip_alphas_cumprod = torch.sqrt(1 / self.alphas_cumprod).to(self.device)
+        self.sqrt_recipm1_alphas_cumprod = torch.sqrt(1 / self.alphas_cumprod - 1).to(self.device)
 
-        # calculations for posterior q(x_{t-1} | x_t, x_0)
-        self.posterior_variance = self.betas * (1 - self.alphas_cumprod_prev) / (1 - self.alphas_cumprod)
-        self.posterior_log_variance_clipped = torch.log(torch.clamp(self.posterior_variance, min=1e-20))
-        self.posterior_mean_coef1 = self.betas * torch.sqrt(self.alphas_cumprod_prev) / (1 - self.alphas_cumprod)
-        self.posterior_mean_coef2 = (1 - self.alphas_cumprod_prev) * torch.sqrt(alphas) / (1 - self.alphas_cumprod)
+        # Calculations for posterior q(x_{t-1} | x_t, x_0)
+        self.posterior_variance = (self.betas * (1 - self.alphas_cumprod_prev) / 
+                                   (1 - self.alphas_cumprod)).to(self.device)
+        self.posterior_log_variance_clipped = torch.log(torch.clamp(self.posterior_variance, min=1e-20)).to(self.device)
+        self.posterior_mean_coef1 = (self.betas * torch.sqrt(self.alphas_cumprod_prev) / 
+                                     (1 - self.alphas_cumprod)).to(self.device)
+        self.posterior_mean_coef2 = ((1 - self.alphas_cumprod_prev) * torch.sqrt(alphas) / 
+                                     (1 - self.alphas_cumprod)).to(self.device)
 
     @staticmethod
     def _extract(a, t, x_shape):
@@ -84,11 +90,16 @@ class GaussianDiffusion:
         Extract some coefficients at specified timesteps,
         then reshape to [batch_size, 1, 1, 1, 1, ...] for broadcasting purposes.
         """
+        # Ensure 'a' is on the same device as 't'
+        a = a.to(t.device)
         bs, = t.shape
         assert x_shape[0] == bs
         out = torch.index_select(a, 0, t)
         assert out.shape == torch.Size([bs])
         return out.view(bs, *((len(x_shape) - 1) * [1]))
+    
+    # ... rest of the class remains unchanged ...
+
     
     def q_mean_variance(self, x_start, t):
         # q(x_{t} | x_0)
@@ -101,8 +112,9 @@ class GaussianDiffusion:
         '''
         Diffuse the data (t == 0 means diffused for 1 step)
         '''
+        assert x_start.device == noise.device, f"x_start.device: {x_start.device}, noise.device: {noise.device}"
         if noise is None:
-            noise = torch.randn(x_start.shape)
+            noise = torch.randn(x_start.shape, device=x_start.device)
         assert noise.shape == x_start.shape
         # mean + sqrt(var) * noise
         return (
@@ -137,19 +149,21 @@ class GaussianDiffusion:
         """
         Training loss calculation
         """
-        B, C, H, W = x_start.shape.as_list()
-        assert t.shape == [B]
+        B, C, H, W = x_start.shape
+        assert t.shape[0] == B, f"x_start.shape: {x_start.shape}, t.shape: {t.shape}, B: {B}"
 
         if noise is None:
-            noise = torch.randn(x_start.shape, dtype=x_start.dtype)
+            noise = torch.randn(x_start.shape, dtype=x_start.dtype, device=x_start.device)
         assert noise.shape == x_start.shape
+        # at each time step t, add noise to x_0 to get x_t, following the forward diffusion process
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+        # predict noise added to x_0 to create x_t
         x_recon = denoise_fn(x_noisy, t)
         assert x_noisy.shape == x_start.shape
         assert x_recon.shape[:3] == [B, C, H] and len(x_recon.shape) == 4
 
         if self.loss_type == 'noisepred':
-            # prdict the noise instead of x_start. Seems to be weighted naturally like SNR
+            # predict the noise instead of x_start. Seems to be weighted naturally like SNR
             assert x_recon.shape == x_start.shape
             # Compute element-wise squared difference
             loss = (x_recon - noise) ** 2
