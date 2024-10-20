@@ -312,9 +312,10 @@ class UNet2DModel(nn.Module):
                  ch_mult=(1, 2, 4, 8), dropout=0., resamp_with_conv=True, conv_shortcut=False) -> None:
         super().__init__()
 
-        num_resolutions = len(ch_mult)
+        self.num_resolutions = len(ch_mult)
         assert num_classes == 1, 'Only unconditional models are supported.'
         self.ch = ch
+        self.num_res_blocks = num_res_blocks
 
         self.time_embedding = TimestepEmbedding(ch, ch * 4)
 
@@ -322,19 +323,19 @@ class UNet2DModel(nn.Module):
         self.conv_in = nn.Conv2d(in_channels=in_channels, out_channels=self.ch, kernel_size=3, stride=1, padding=1)
         self.down_blocks = nn.ModuleList()  # Use nn.ModuleList instead of a plain list
         in_ch = self.conv_in.out_channels
-        for i_level in range(num_resolutions):
+        for i_level in range(self.num_resolutions):
             # Calculate the current resolution at this downsampling level
             current_resolution = initial_resolution // 2 ** i_level
             if current_resolution in attn_resolutions:
                 self.down_blocks.append(AttnDownBlock2D(in_ch=in_ch, out_ch=ch * ch_mult[i_level],
                                                         temb_channels=ch * 4, num_res_blocks=num_res_blocks,
-                                                        num_resolutions=num_resolutions, i_level=i_level,
+                                                        num_resolutions=self.num_resolutions, i_level=i_level,
                                                         dropout=dropout, conv_shortcut=conv_shortcut,
                                                         resamp_with_conv=resamp_with_conv))
             else:
                 self.down_blocks.append(DownBlock2D(in_ch=in_ch, out_ch=ch * ch_mult[i_level],
                                                         temb_channels=ch * 4, num_res_blocks=num_res_blocks,
-                                                        num_resolutions=num_resolutions, i_level=i_level,
+                                                        num_resolutions=self.num_resolutions, i_level=i_level,
                                                         dropout=dropout, conv_shortcut=conv_shortcut,
                                                         resamp_with_conv=resamp_with_conv))
             in_ch = ch * ch_mult[i_level]
@@ -349,7 +350,7 @@ class UNet2DModel(nn.Module):
         # Upsampling
         self.up_blocks = nn.ModuleList()
         in_ch = self.mid_block2.out_ch
-        for i_level in reversed(range(num_resolutions)):
+        for i_level in reversed(range(self.num_resolutions)):
             current_resolution = initial_resolution // 2 ** i_level
             level_out_ch = ch if i_level == 0 else ch * ch_mult[i_level]            
             skip_conn_ch = [self.down_blocks[i_level].resnets[j].out_ch for j in reversed(range(num_res_blocks))]
@@ -361,13 +362,13 @@ class UNet2DModel(nn.Module):
             if current_resolution in attn_resolutions:
                 self.up_blocks.append(AttnUpBlock2D(in_ch=in_ch, skip_conn_ch=skip_conn_ch,
                                                     out_ch=level_out_ch, num_res_blocks=num_res_blocks,
-                                                    num_resolutions=num_resolutions, i_level=i_level,
+                                                    num_resolutions=self.num_resolutions, i_level=i_level,
                                                     dropout=dropout, conv_shortcut=conv_shortcut,
                                                     resamp_with_conv=resamp_with_conv, temb_channels=ch * 4))
             else:
                 self.up_blocks.append(UpBlock2D(in_ch=in_ch, skip_conn_ch=skip_conn_ch,
                                                 out_ch=level_out_ch, num_res_blocks=num_res_blocks,
-                                                num_resolutions=num_resolutions, i_level=i_level,
+                                                num_resolutions=self.num_resolutions, i_level=i_level,
                                                 dropout=dropout, conv_shortcut=conv_shortcut,
                                                 resamp_with_conv=resamp_with_conv, temb_channels=ch * 4))
             in_ch = ch * ch_mult[i_level]
@@ -381,50 +382,33 @@ class UNet2DModel(nn.Module):
         assert x.dtype == DEFAULT_DTYPE, f"Expected x dtype {DEFAULT_DTYPE}, but got {x.dtype}"
         assert t.dtype in [torch.int32, torch.int64], f"Expected t dtype int32 or int64, but got {t.dtype}"
 
-        # Debug: Check device of 'x' and 't'
-        print(f"x device: {x.device}, t device: {t.device}")
-
         temb = get_timestep_embedding(t, self.ch)
-        print(f"emb device after get_timestep_embedding: {temb.device}")  # Should match 't.device'
-
         temb = self.time_embedding(temb)
-        print(f"temb device after time_embedding: {temb.device}")  # Should match 'x.device'
 
         # Corrected assertion: use tuple instead of list
         expected_shape = (B, self.ch * 4)
         assert temb.shape == expected_shape, f"Expected temb shape {expected_shape}, but got {temb.shape}"
 
-        print(f"x shape before: {x.shape}")
         h = self.conv_in(x)
-        print(f"h shape after conv_in: {h.shape}")
-        hs = [h]
-
+        h_conv_in = h
+        
+        hs = []
         for i_level, block in enumerate(self.down_blocks):
-            for i_block, layer in enumerate(block):
-                # print(f"block: {block_ind}, layer: {layer_ind}, layer: {type(layer)}, h shape before: {h.shape}")
-                if isinstance(layer, Downsample):
-                    h = layer(h)
-                else:
-                    h = layer(h, temb)
-                # print(f"block: {block_ind}, layer: {layer_ind}, layer: {type(layer)}, h shape after: {h.shape}")
-                hs.append(h)
+            h, hs_i_level = block(h, temb)
+            hs.append(hs_i_level)
 
         h = self.mid_block1(h, temb)
         h = self.mid_attn(h, temb)
         h = self.mid_block2(h, temb)
-        print(f"mid_block2 in: {self.mid_block2.in_ch}, h shape after: {h.shape}")
-
-        for i_level, block in enumerate(self.up_blocks):
-            hs_connection = hs.pop()
-            print(f"block_ind: {i_level}, hs_connection: {hs_connection.shape}, h shape before: {h.shape}")
-            h = torch.cat([h, hs_connection], dim=1)
-            for i_block, layer in enumerate(block):
-                print(f"block: {i_level}, layer: {i_block}, layer: {type(layer)}, h shape before: {h.shape}")
-                if isinstance(layer, Upsample):
-                    h = layer(h)
-                else:
-                    h = layer(h, temb)
-                print(f"block: {i_level}, layer: {i_block}, layer: {type(layer)}, h shape after: {h.shape}")
+   
+        for i, block in enumerate(self.up_blocks):
+            i_level = self.num_resolutions - i - 1
+            hs_skip_conn = hs[i_level][:self.num_res_blocks]
+            if i_level != 0:
+                hs_skip_conn.append(hs[i_level - 1][-1])
+            else:
+                hs_skip_conn.append(h_conv_in)
+            h = block(h, hs_skip_conn, temb)
 
         h = self.conv_norm_out(h)
         h = F.silu(h)

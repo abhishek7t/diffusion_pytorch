@@ -1,3 +1,4 @@
+import pdb
 from torch.nn import functional as F
 import torch
 import numpy as np
@@ -160,7 +161,7 @@ class GaussianDiffusion:
         # predict noise added to x_0 to create x_t
         x_recon = denoise_fn(x_noisy, t)
         assert x_noisy.shape == x_start.shape
-        assert x_recon.shape[:3] == [B, C, H] and len(x_recon.shape) == 4
+        assert x_recon.shape == x_start.shape and len(x_recon.shape) == 4
 
         if self.loss_type == 'noisepred':
             # predict the noise instead of x_start. Seems to be weighted naturally like SNR
@@ -172,7 +173,7 @@ class GaussianDiffusion:
         else:
             raise NotImplementedError(self.loss_type)
         
-        assert loss.shape == [B]
+        assert losses.shape == torch.Size([B])
         return losses
     
     def p_mean_variance(self, denoise_fn, *, x, t, clip_denoised):
