@@ -113,7 +113,8 @@ class GaussianDiffusion:
         '''
         Diffuse the data (t == 0 means diffused for 1 step)
         '''
-        assert x_start.device == noise.device, f"x_start.device: {x_start.device}, noise.device: {noise.device}"
+        if noise != None:
+            assert x_start.device == noise.device, f"x_start.device: {x_start.device}, noise.device: {noise.device}"
         if noise is None:
             noise = torch.randn(x_start.shape, device=x_start.device)
         assert noise.shape == x_start.shape
@@ -126,6 +127,10 @@ class GaussianDiffusion:
     def predict_start_from_noise(self, x_t, t, noise):
         # x_0 = x_t / sqrt_alphas_cumprod - noise * sqrt(var) / sqrt_alphas_cumprod 
         assert x_t.shape == noise.shape
+        assert self.sqrt_recip_alphas_cumprod.device == t.device, f"self.sqrt_recip_alphas_cumprod.device: {self.sqrt_recip_alphas_cumprod.device}, t.device: {t.device}"
+        assert t.device == x_t.device
+        assert x_t.device == noise.device
+        assert noise.device == self.sqrt_recipm1_alphas_cumprod.device, f"self.sqrt_recipm1_alphas_cumprod.device: {self.sqrt_recipm1_alphas_cumprod.device}, noise.device: {noise.device}"
         return (
             self._extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
             self._extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
@@ -189,7 +194,7 @@ class GaussianDiffusion:
             x_start=x_recon, x_t=x, t=t
         )
         assert model_mean.shape == x_recon.shape == x.shape
-        assert posterior_variance.shape == posterior_log_variance.shape == [x.shape[0], 1, 1, 1]
+        assert posterior_variance.shape == posterior_log_variance.shape == torch.Size([x.shape[0], 1, 1, 1])
         return model_mean, posterior_variance, posterior_log_variance
     
     def p_sample(self, denoise_fn, *, x, t, noise_fn, clip_denoised=True, repeat_noise=False):
@@ -198,23 +203,26 @@ class GaussianDiffusion:
         """
         model_mean, _, model_log_variance = self.p_mean_variance(denoise_fn, x=x, t=t,
                                                                  clip_denoised=clip_denoised)
-        noise = noise_like(x.shape, noise_fn, repeat_noise)
+        noise = noise_like(x.shape, noise_fn, repeat_noise).to(model_log_variance.device)
         assert noise.shape == x.shape
         # no noise when t == 0
-        nonzero_mask = (t != 0).float().view(x.shape[0], *([1] * (len(x.shape) - 1)))
-        return model_mean + torch.exp(.5 * model_log_variance) * noise
+        nonzero_mask = (t != 0).float().view(x.shape[0], *([1] * (len(x.shape) - 1))) # [1] * (len(x.shape) - 1)) == [1, 1, 1], [B, 1, 1, 1]
+        assert model_mean.device == nonzero_mask.device
+        assert nonzero_mask.device == model_log_variance.device
+        assert model_log_variance.device == noise.device, f"model_log_variance.device: {model_log_variance.device}, noise.device: {noise.device}"
+        return model_mean + nonzero_mask * torch.exp(.5 * model_log_variance) * noise # mu + nonzero_mask * sigma * epsilon
     
-    def p_sample_loop(self, denoise_fn, *, shape, noise_fn=torch.randn):
+    def p_sample_loop(self, denoise_fn, *, shape, noise_fn=torch.randn, device):
         """
         Generate samples
         """
-        i_0 = torch.tensor(self.num_timesteps - 1, dtype=torch.int32)
+        i_0 = torch.tensor(self.num_timesteps - 1, dtype=torch.int32, device=device)
         assert isinstance(shape, (tuple, list))
-        img_0 = noise_fn(size=shape, dtype=torch.float32)
+        img_0 = noise_fn(size=shape, dtype=torch.float32).to(device)
         img_ = img_0
         for i_ in range(i_0, -1, -1):
             img_ = self.p_sample(denoise_fn=denoise_fn, x=img_,
-                                 t=torch.full((shape[0],), i_, dtype=torch.int32),  # Create a tensor of timesteps
+                                 t=torch.full((shape[0],), i_, dtype=torch.int32, device=device),  # Create a tensor of timesteps
                                  noise_fn=noise_fn)
             
         assert img_.shape == torch.Size(shape)

@@ -62,17 +62,28 @@ class Model(nn.Module):
 
     def train_fn(self, x: torch.Tensor, y: torch.Tensor):
         B, C, H, W = x.shape
-
+        # Sample a random timestep for each image
         t = torch.randint(
             low=0, high=self.diffusion.num_timesteps, size=(B,), device=x.device
         )
-        losses = self.diffusion.p_losses(
-            denoise_fn=lambda x, t: self._denoise(x, t, dropout=self.dropout),
-            x_start=x,
-            t=t
-        )
-        assert losses.shape == (B,)
-        loss = torch.mean(losses)
+        # losses = self.diffusion.p_losses(
+        #     denoise_fn=lambda x, t: self._denoise(x, t, dropout=self.dropout),
+        #     x_start=x,
+        #     t=t
+        # )
+        # assert losses.shape == (B,)
+        # loss = torch.mean(losses)
+        
+        noise = torch.randn(x.shape).to(x.device)
+        
+        # Add noise to the clean images according to the noise magnitude at each timestep
+        # (this is the forward diffusion process)
+        noisy_images = self.diffusion.q_sample(x_start=x, t=t, noise=noise)
+        
+        # Predict the noise residual
+        noise_pred = self.unet(noisy_images, t)
+        loss = F.mse_loss(noise_pred, noise)
+        
         return {'loss': loss}
 
     def samples_fn(self, shape, device):
@@ -94,7 +105,8 @@ dataset_name = 'celebahq256'
 optimizer_name = 'adam'
 total_bs = 64
 grad_clip = 1.0
-lr = 0.00002
+# lr = 0.00002
+lr = 1e-5
 warmup = 5000
 num_diffusion_timesteps = 1000
 beta_start = 0.0001
@@ -110,7 +122,7 @@ model_name = 'unet2d16b2c112244'
 # Memory Optimization Parameters
 effective_batch_size = 64  # Desired effective batch size
 
-actual_batch_size = 16
+actual_batch_size = 8
 accumulation_steps = effective_batch_size // actual_batch_size # Number of steps to accumulate gradients
 
 model_dir = os.path.join(log_dir, 'models', 'celebhq_diffusion')
@@ -155,7 +167,7 @@ scheduler = torch.optim.lr_scheduler.LambdaLR(
 writer = SummaryWriter(log_dir=os.path.join(log_dir, 'runs', model_name))
 
 # Training function
-def train(model, dataloader, optimizer, scheduler, num_epochs, device,
+def train(model: Model, dataloader, optimizer, scheduler, num_epochs, device,
           accumulation_steps):
     model.train()
     global_step = 0
@@ -177,15 +189,17 @@ def train(model, dataloader, optimizer, scheduler, num_epochs, device,
             # Logging
             writer.add_scalar('Loss/train', loss.item(), global_step)
             writer.add_scalar('Learning Rate', scheduler.get_last_lr()[0], global_step)
+            # break
 
-            if global_step % 500 == 0:
+            if global_step % 50 == 0:
                 print(f"Iteration {global_step}, Loss: {loss.item():.6f}")
                 # Save model checkpoint
-                torch.save(model.state_dict(), os.path.join(model_dir, f'model_{global_step}.pt'))
+                # torch.save(model.state_dict(), os.path.join(model_dir, f'model_{global_step}.pt'))
             if global_step >= num_epochs:
                 break
         if global_step >= num_epochs:
             break
+        break
     writer.close()
 
 # Evaluation function (optional)

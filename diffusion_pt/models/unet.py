@@ -143,20 +143,20 @@ class AttnBlock(nn.Module):
     def __init__(self, in_ch):
         super().__init__()
 
-        self.q_nin = Nin(in_ch, in_ch)
-        self.k_nin = Nin(in_ch, in_ch)
-        self.v_nin = Nin(in_ch, in_ch)
+        self.to_q = Nin(in_ch, in_ch)
+        self.to_k = Nin(in_ch, in_ch)
+        self.to_v = Nin(in_ch, in_ch)
         self.norm = nn.GroupNorm(num_groups=32, num_channels=in_ch, eps=1e-6)
-        self.out_proj = Nin(in_ch, in_ch, init_scale=0.0)  # Verify shape
+        self.to_out = Nin(in_ch, in_ch, init_scale=0.0)  # Verify shape
 
     def forward(self, x, temb):
         # temb not actually used in attention in this case
         B, C, H, W = x.shape
 
         h = self.norm(x)
-        q = self.q_nin(h)  # (B, C, H, W)
-        k = self.k_nin(h)
-        v = self.v_nin(h)
+        q = self.to_q(h)  # (B, C, H, W)
+        k = self.to_k(h)
+        v = self.to_v(h)
 
         q = q.permute(0, 2, 3, 1).contiguous().view(B, H * W, C)  # (B, H*W, C)
         k = k.permute(0, 2, 3, 1).contiguous().view(B, H * W, C)
@@ -173,7 +173,7 @@ class AttnBlock(nn.Module):
         h = h.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()  # (B, C, H, W)
 
         # Output projection
-        h = self.out_proj(h)
+        h = self.to_out(h)
 
         # Residual connection
         return x + h
