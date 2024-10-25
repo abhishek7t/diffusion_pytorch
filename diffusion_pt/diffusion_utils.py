@@ -1,5 +1,3 @@
-import pdb
-from torch.nn import functional as F
 import torch
 import numpy as np
 
@@ -99,9 +97,6 @@ class GaussianDiffusion:
         assert out.shape == torch.Size([bs])
         return out.view(bs, *((len(x_shape) - 1) * [1]))
     
-    # ... rest of the class remains unchanged ...
-
-    
     def q_mean_variance(self, x_start, t):
         # q(x_{t} | x_0)
         mean = self._extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
@@ -121,7 +116,7 @@ class GaussianDiffusion:
         # mean + sqrt(var) * noise
         return (
             self._extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
-            self._extract(1 - self.alphas_cumprod, t, x_start.shape) * noise
+            self._extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
     
     def predict_start_from_noise(self, x_t, t, noise):
@@ -182,13 +177,17 @@ class GaussianDiffusion:
         return losses
     
     def p_mean_variance(self, denoise_fn, *, x, t, clip_denoised):
+        '''
+        Using reverse process p_θ(x_{t-1} | x_t) to estimate diffusion posterior q(x_{t-1} | x_t, x_0),
+        target is to minimize KL divergence between the two
+        '''
         if self.loss_type == 'noisepred':
             x_recon = self.predict_start_from_noise(x, t=t, noise=denoise_fn(x, t))
         else:
             raise NotImplementedError(self.loss_type)
         
         if clip_denoised:
-            x_recon = torch.clamp(x_recon, -1., 1.)
+            x_recon = torch.clamp(x_recon, -1., 1.) # all pixel values ∈ [-1, 1]
 
         model_mean, posterior_variance, posterior_log_variance = self.q_posterior(
             x_start=x_recon, x_t=x, t=t
