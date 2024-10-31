@@ -40,7 +40,7 @@ class Upsample(nn.Module):
         return x
 
 
-def get_timestep_embedding(timesteps, embedding_dim: int):
+def get_timestep_embedding(timesteps: torch.Tensor, embedding_dim: int):
     """
     Create sinusoidal timestep embeddings.
     Ensures that all tensors are on the same device as 'timesteps'.
@@ -54,11 +54,11 @@ def get_timestep_embedding(timesteps, embedding_dim: int):
 
     # Create 'emb' on the same device and dtype as 'timesteps'
     emb = torch.exp(
-        torch.arange(half_dim, dtype=timesteps.dtype, device=timesteps.device) * -emb_scale
+        torch.arange(half_dim, dtype=torch.float32, device=timesteps.device) * -emb_scale
     )
 
-    emb = timesteps.to(timesteps.dtype)[:, None] * emb[None, :]  # (N, half_dim)
-    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)       # (N, embedding_dim)
+    emb = timesteps[:, None] * emb[None, :]  # (N, half_dim)
+    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)   # (N, embedding_dim)
 
     # If embedding_dim is odd, pad with an additional column of zeros
     if embedding_dim % 2 == 1:
